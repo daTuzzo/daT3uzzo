@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Stand-in pages, test audio and the T3 Code stylesheet copy (eval/make_harness.py, eval/smoke_helper.py)
+eval/out/
+
+# Temporary files the helper writes next to T3 Code's pages
+*.dat3uzzo-tmp
+*.dat3uzzo-new
+
+# Secrets never belong here: the helper keeps its token and keys outside the repo
+.env
+.env.*
+*.pem
+*.key
+token
+.mcp.json
