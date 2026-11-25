@@ -71,6 +71,27 @@ A client patch is a T3 Code commit that changes T3 Code's own page files and tha
 
 The helper records each original's and each staged archive's client folder in `client-patch.json`. So it never backs up a patched archive as an original, and it leaves an archive it did not make alone.
 
+### Build ahead (`dat3uzzo/client_prebuild.py`)
+
+An update replaces `server.asar`, so the patch is gone until the helper swaps it in again. To make that quick, the helper builds the patch for a release before it is installed:
+
+1. **Tags.** About every 30 minutes, `git ls-remote --tags --refs origin` in the clone lists the release tags. The helper keeps those of the installed channel: Nightly `v<x.y.z>-nightly.<yyyymmdd>.<run>`, Stable `v<x.y.z>`. Previews are never built ahead.
+2. **The release's own archive.** A staged archive is the release's `server.asar` with only the client folder replaced, so the helper needs that file before the install. On Windows it ships only inside the installer `T3-Code-<version>-<arch>.exe`, where electron-builder stores `app-<arch>.7z` uncompressed.
+   - The installer is the updater's own download (`%LOCALAPPDATA%\t3code-updater\pending`) when it is that version, else the GitHub release asset.
+   - Its SHA-512 must match what the updater checks: `update-info.json`, or the release's `nightly.yml` or `latest.yml`. A release whose files are not published yet is tried again at the next check.
+   - The helper cuts `app-<arch>.7z` out of the installer by its 7z signature and its two header CRCs. Then [py7zr](https://github.com/miurahr/py7zr) (LGPL-2.1-or-later) extracts `resources/server.asar` and `resources/server.asar.unpacked`.
+3. **The build** is the same as for an installed version, with that original. The work folder is deleted afterwards.
+4. **Retention.** The helper keeps the 2 newest staged builds per channel, plus the installed version's. That manifest tells the helper that the patch is in.
+5. **A failed build ahead** is recorded in `client-patch-prebuild.json` with its reason, and the Settings row shows it. That version is not built ahead again for the same patches. When it is installed, the normal build runs, with its own retry rule.
+
+### Right after an update
+
+The helper remembers the version it last saw running (`last_running_version` in `client-patch.json`). When T3 Code runs a different version, that is an update. Then:
+
+- If the patch for the new version is staged and not in yet, the helper restarts T3 Code once, the graceful way below. It waits until T3 Code has run for 10 seconds and shows a window.
+- If it is not staged yet, the helper builds it, then restarts T3 Code once it is ready, but only within 15 minutes of T3 Code's start (the start time of its oldest process). After that, the row shows the **Restart T3 now** button, and the patch goes in at the next restart.
+- The restart happens once per update, and never without a version change. The first version the helper ever sees counts as no change.
+
 ### Restart T3 now
 
 While a swap waits, the Settings row shows a **Restart T3 now** button. A script can do the same with `GET http://127.0.0.1:47613/client/restart?token=<install token>`: `202` when the restart starts, `409` when nothing waits, `403` without the token. `GET /client/state?token=...` returns each patch's status.
@@ -83,7 +104,7 @@ A process that T3 Code starts, for example an agent's shell, runs in T3 Code's j
 
 ### Commands for debugging
 
-- `client status`: each patch's status, the installed version and kind, the staged archive, the backups, the last build.
+- `client status`: each patch's status, the installed version and kind, the staged archive, the backups, the last build, the newest tag and each build ahead, the staged builds, and the last version seen running.
 - `client rebuild`: build the staged archive for the installed version now, in the foreground.
 - `client apply` and `client restore`: wait until T3 Code closes, then swap. They do not open T3 Code.
 - `restart`: restart the helper itself. T3 Code is not touched.

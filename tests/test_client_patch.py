@@ -96,13 +96,39 @@ class Base(unittest.TestCase):
         cp._HEADERS.clear()
         self.tmp.cleanup()
 
-    def pilot(self, builder=None) -> cp.Autopilot:
+    def pilot(self, builder=None, fetcher=None) -> cp.Autopilot:
+        # No git, no network, no windows: tags, release archives, start times and windows are stubs.
+        self.tags: list[str] = getattr(self, "tags", [])
+        self.started = getattr(self, "started", None)
+        self.windows = getattr(self, "windows", 1)
         return cp.Autopilot(lister=lambda: list(self.running), builder=builder or self.stub_build,
-                            now=lambda: self.t, sleep=lambda s: None)
+                            now=lambda: self.t, sleep=lambda s: None,
+                            tag_lister=lambda repo: self.polls.append(repo) or list(self.tags),
+                            fetcher=fetcher or self.stub_fetch,
+                            started_at=lambda pids: self.started, window_counter=lambda pids: self.windows)
 
-    def stub_build(self, version, patches, keys, repo, original, log_path, out=None):
+    @property
+    def polls(self) -> list:
+        if not hasattr(self, "_polls"):
+            self._polls = []
+        return self._polls
+
+    def stub_build(self, version, patches, keys, repo, original, log_path, out=None, unpacked=None):
         self.built.append(version)
         return stage_fake(version, keys)
+
+    def stub_fetch(self, version, work):
+        """A release's original archive, as client_prebuild.fetch_original leaves it in the work folder."""
+        asar = work / "x" / "resources" / "server.asar"
+        make_archive(asar, server_files(version) | ORIGINAL_CLIENT, {NATIVE})
+        self.fetched.append(version)
+        return asar, asar.with_name("server.asar.unpacked")
+
+    @property
+    def fetched(self) -> list:
+        if not hasattr(self, "_fetched"):
+            self._fetched = []
+        return self._fetched
 
     def tick(self, pilot) -> dict:
         result = pilot.tick()
@@ -505,6 +531,279 @@ class Pieces(Base):
         (dist / "assets").mkdir(parents=True)
         (dist / "assets" / "publicConfig-BBBB.js").write_bytes(chunk(cb.MARKERS))
         self.assertEqual(cb.public_config(dist, self.asar), real)
+
+
+V3 = "0.1.13-nightly.20261125.5245"
+
+
+class Tags(Base):
+    def test_the_newest_tag_of_the_installed_channel(self):
+        from dat3uzzo import client_prebuild as pb
+        tags = [V1, V3, V2, "0.1.11", "0.1.12", "0.1.14-preview.20261126.3", "0.1.13-nightly.20261125.5244"]
+        self.assertEqual(pb.newest(tags, "nightly"), V3)
+        self.assertEqual(pb.newest(tags, "stable"), "0.1.12")
+        self.assertIsNone(pb.channel("0.1.14-preview.20261126.3"))
+        self.assertLess(pb.version_key("0.1.12-nightly.20261231.9"), pb.version_key("0.1.13-nightly.20261101.1"))
+
+    def test_tags_are_polled_about_every_30_minutes(self):
+        stage_fake(V1, self.keys)
+        pilot = self.pilot()
+        self.tick(pilot)
+        self.tick(pilot)
+        self.t += 60
+        self.tick(pilot)
+        self.assertEqual(len(self.polls), 1)
+        self.t += cp.TAG_POLL_SECONDS
+        self.tick(pilot)
+        self.assertEqual(len(self.polls), 2)
+
+    def test_no_build_ahead_while_the_newest_tag_is_installed(self):
+        stage_fake(V1, self.keys)
+        self.tags = [V1, "0.1.11-nightly.20261118.4877"]
+        pilot = self.pilot()
+        self.tick(pilot)
+        self.assertEqual(self.fetched, [])
+
+
+class BuildAhead(Base):
+    def test_stages_the_newest_tag_from_its_release_archive(self):
+        stage_fake(V1, self.keys)
+        self.tags = [V1, V2, V3]
+        seen = {}
+
+        def build(version, patches, keys, repo, original, log_path, out=None, unpacked=None):
+            seen.update(version=version, original_version=cp.archive_version(original), unpacked=unpacked)
+            return stage_fake(version, keys)
+
+        pilot = self.pilot(builder=build)
+        self.tick(pilot)  # applies V1 (T3 Code is closed), then builds ahead for V3
+        self.assertEqual(seen["version"], V3)
+        self.assertEqual(seen["original_version"], V3)  # the release's own archive, not the installed one
+        self.assertTrue(str(seen["unpacked"]).endswith("server.asar.unpacked"))
+        self.assertEqual(json.loads(cp.prebuild_file().read_text())["tags"][V3]["state"], "staged")
+        self.assertFalse(any((cp.config.data_dir() / "prebuild").glob("*/x")))  # the work folder is gone
+        self.tick(pilot)
+        self.assertIn(f"ready ahead of its install", pilot.statuses["usage-periods"]["text"])
+        self.t += cp.TAG_POLL_SECONDS + 1
+        self.tick(pilot)
+        self.assertEqual(self.fetched, [V3])  # staged once, not again
+
+    def test_keeps_the_two_newest_per_channel_and_the_installed_one(self):
+        from dat3uzzo import client_prebuild as pb
+        nightly = ["0.1.11-nightly.20261118.4877", V1, V2, V3]
+        stable = ["0.1.10", "0.1.11", "0.1.12"]
+        for v in nightly + stable:
+            stage_fake(v, self.keys)
+        deleted = pb.prune_staged(installed="0.1.11-nightly.20261118.4877")
+        left = sorted(d.name for d in (cp.config.data_dir() / "client-patch").iterdir())
+        self.assertEqual(sorted(deleted), sorted([V1, "0.1.10"]))
+        self.assertEqual(left, sorted(["0.1.11-nightly.20261118.4877", V2, V3, "0.1.11", "0.1.12"]))
+
+    def test_a_failed_build_ahead_is_skipped_with_its_reason(self):
+        stage_fake(V1, self.keys)
+        self.tags = [V1, V3]
+        tries = []
+
+        def build(version, patches, keys, repo, original, log_path, out=None, unpacked=None):
+            if version == V3:
+                tries.append(version)
+                raise RuntimeError(f"usage-periods: commit b3b98439c0 does not apply to v{V3} (conflict in a.ts)")
+            return stage_fake(version, keys)
+
+        pilot = self.pilot(builder=build)
+        self.tick(pilot)
+        self.tick(pilot)
+        rec = json.loads(cp.prebuild_file().read_text())["tags"][V3]
+        self.assertEqual(rec["state"], "failed")
+        text = pilot.statuses["usage-periods"]["text"]
+        self.assertIn(f"The build ahead for T3 Code {V3} failed, so the helper skips that version", text)
+        self.assertIn("conflict in a.ts", text)
+        self.assertEqual(pilot.statuses["usage-periods"]["state"], "active")  # the installed patch stays
+        self.t += cp.TAG_POLL_SECONDS + 1
+        self.tick(pilot)
+        self.assertEqual(tries, [V3])  # never tried again for the same patches
+
+    def test_an_unpublished_release_is_tried_again_later(self):
+        from dat3uzzo import client_prebuild as pb
+        stage_fake(V1, self.keys)
+        self.tags = [V1, V3]
+        calls = []
+
+        def fetch(version, work):
+            calls.append(version)
+            if len(calls) == 1:
+                raise pb.NotPublished(f"v{V3} has no nightly.yml yet")
+            return self.stub_fetch(version, work)
+
+        pilot = self.pilot(fetcher=fetch)
+        self.tick(pilot)
+        self.assertEqual(json.loads(cp.prebuild_file().read_text())["tags"][V3]["state"], "unpublished")
+        self.t += cp.TAG_POLL_SECONDS + 1
+        self.tick(pilot)
+        self.assertEqual(json.loads(cp.prebuild_file().read_text())["tags"][V3]["state"], "staged")
+
+    def test_the_original_comes_out_of_an_installer(self):
+        import py7zr
+        from dat3uzzo import client_prebuild as pb
+        src = self.root / "src" / "resources"
+        (src / "server.asar.unpacked" / "node_modules").mkdir(parents=True)
+        (src / "server.asar").write_bytes(b"ASAR" * 1000)
+        (src / "server.asar.unpacked" / "node_modules" / "addon.node").write_bytes(b"MZ addon")
+        (src / "app.asar").write_bytes(b"not needed")
+        archive = self.root / "app-64.7z"
+        with py7zr.SevenZipFile(archive, "w") as z:
+            z.writeall(src, "resources")
+        # An NSIS installer: code (with a stray 7z signature), then the stored archive, then more data.
+        exe = self.root / "T3-Code-setup.exe"
+        exe.write_bytes(b"MZ" + b"\0" * 100 + pb.SEVEN_ZIP + b"\0" * 40 + archive.read_bytes() + b"\0" * 64)
+        asar, unpacked = pb.extract_original(exe, self.root / "work")
+        self.assertEqual(asar.read_bytes(), b"ASAR" * 1000)
+        self.assertEqual((unpacked / "node_modules" / "addon.node").read_bytes(), b"MZ addon")
+        self.assertFalse((asar.parent / "app.asar").exists())
+        self.assertFalse((self.root / "work" / "app.7z").exists())
+
+    def test_the_installer_is_checked_against_the_release_sha512(self):
+        import base64
+        import hashlib
+        import io
+        from dat3uzzo import client_prebuild as pb
+        body = b"installer bytes"
+        good = base64.b64encode(hashlib.sha512(body).digest()).decode()
+        name = pb.installer_name(V3)
+
+        def opener_for(sha):
+            def opener(request, timeout=0):
+                url = request.full_url
+                if url.endswith("nightly.yml"):
+                    return io.BytesIO(f"files:\n  - url: {name}\n    sha512: {sha}\n    size: 15\n".encode())
+                if url.endswith(name):
+                    return io.BytesIO(body)
+                raise AssertionError(url)
+            return opener
+
+        path = pb.fetch_installer(V3, self.root / "w1", opener=opener_for(good))
+        self.assertEqual(path.read_bytes(), body)
+        with self.assertRaises(OSError):
+            pb.fetch_installer(V3, self.root / "w2", opener=opener_for("bad"))
+        self.assertFalse(list((self.root / "w2").glob("*.exe")))
+
+        def missing(request, timeout=0):
+            import urllib.error
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+        with self.assertRaises(pb.NotPublished):
+            pb.fetch_installer(V3, self.root / "w3", opener=missing)
+
+    def test_the_updaters_own_download_is_used_when_it_matches(self):
+        import base64
+        import hashlib
+        from dat3uzzo import client_prebuild as pb
+        pending = self.root / "t3code-updater" / "pending"
+        pending.mkdir(parents=True)
+        name = pb.installer_name(V3)
+        (pending / name).write_bytes(b"the updater's file")
+        sha = base64.b64encode(hashlib.sha512(b"the updater's file").digest()).decode()
+        cp._write_json(pending / "update-info.json", {"fileName": name, "sha512": sha})
+
+        def no_network(request, timeout=0):
+            raise AssertionError("no download expected")
+
+        self.assertEqual(pb.fetch_installer(V3, self.root / "w", opener=no_network), pending / name)
+
+
+class AfterUpdate(Base):
+    def updated_to(self, version, staged=True):
+        """T3 Code ran V1 before; now it is installed and running as `version`."""
+        cp._write_json(cp.state_file(), {"last_running_version": V1})
+        make_archive(self.asar, server_files(version) | ORIGINAL_CLIENT, {NATIVE})
+        if staged:
+            stage_fake(version, self.keys)
+        self.running = [(10, self.exe)]
+        self.started = self.t - 30
+        self.windows = 1
+
+    def test_one_restart_right_after_an_update(self):
+        self.updated_to(V3)
+        pilot = self.pilot()
+        self.tick(pilot)
+        self.assertTrue(pilot.auto_restart_due)
+        self.assertIn("restarts it once now", pilot.statuses["usage-periods"]["text"])
+        self.assertEqual(json.loads(cp.state_file().read_text())["update"]["restart"], "done")
+        pilot.auto_restart_due = False  # the watch loop takes it and starts the graceful restart
+        self.t += 60
+        self.tick(pilot)
+        self.assertFalse(pilot.auto_restart_due)  # once only, even while the patch still waits
+
+    def test_no_restart_without_a_version_change(self):
+        stage_fake(V1, self.keys)
+        cp._write_json(cp.state_file(), {"last_running_version": V1})
+        self.running = [(10, self.exe)]
+        self.started = self.t - 30
+        pilot = self.pilot()
+        self.tick(pilot)
+        self.assertFalse(pilot.auto_restart_due)
+        self.assertEqual(self.state(pilot), "pending")
+        self.assertTrue(pilot.statuses["usage-periods"]["restart"])  # the button instead
+
+    def test_the_first_version_the_helper_sees_is_not_an_update(self):
+        stage_fake(V1, self.keys)
+        self.running = [(10, self.exe)]
+        self.started = self.t - 30
+        pilot = self.pilot()
+        self.tick(pilot)
+        self.assertFalse(pilot.auto_restart_due)
+        self.assertEqual(json.loads(cp.state_file().read_text())["last_running_version"], V1)
+
+    def test_waits_until_t3_has_run_a_few_seconds_with_a_window(self):
+        self.updated_to(V3)
+        self.started = self.t - 2
+        pilot = self.pilot()
+        self.tick(pilot)
+        self.assertFalse(pilot.auto_restart_due)
+        self.t += cp.SETTLE_SECONDS
+        self.windows = 0
+        self.tick(pilot)
+        self.assertFalse(pilot.auto_restart_due)
+        self.windows = 1
+        self.tick(pilot)
+        self.assertTrue(pilot.auto_restart_due)
+
+    def test_not_staged_yet_builds_then_restarts_within_15_minutes(self):
+        self.updated_to(V3, staged=False)
+        pilot = self.pilot()
+        first = pilot.tick()
+        self.assertIn("When the patch is built, the helper restarts T3 Code once", first["usage-periods"]["text"])
+        pilot.build_thread.join(5)
+        self.t += 240
+        self.tick(pilot)
+        self.assertEqual(self.built, [V3])
+        self.assertTrue(pilot.auto_restart_due)
+
+    def test_after_15_minutes_it_waits_for_the_next_restart(self):
+        self.updated_to(V3, staged=False)
+        pilot = self.pilot()
+        pilot.tick()
+        pilot.build_thread.join(5)
+        self.t = self.started + cp.UPDATE_WINDOW + 1
+        self.tick(pilot)
+        self.assertFalse(pilot.auto_restart_due)
+        self.assertEqual(json.loads(cp.state_file().read_text())["update"]["restart"], "expired")
+        self.assertEqual(self.state(pilot), "pending")
+        self.assertTrue(pilot.statuses["usage-periods"]["restart"])
+
+    def test_no_restart_when_the_switch_is_off(self):
+        self.updated_to(V3)
+        ui.set_mod("usage-periods", False)
+        pilot = self.pilot()
+        self.tick(pilot)
+        self.assertFalse(pilot.auto_restart_due)
+
+    def test_a_status_check_changes_nothing(self):
+        self.updated_to(V3)
+        cp.Autopilot(lister=lambda: list(self.running), now=lambda: self.t,
+                     started_at=lambda pids: self.started, window_counter=lambda pids: 1).evaluate(act=False)
+        self.assertNotIn("update", json.loads(cp.state_file().read_text()))
+        self.assertEqual(json.loads(cp.state_file().read_text())["last_running_version"], V1)
 
 
 if __name__ == "__main__":

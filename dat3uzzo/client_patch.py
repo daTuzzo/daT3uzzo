@@ -12,6 +12,12 @@ rest with no manual step:
 - When the switches are off, it puts the original back once T3 Code is closed.
 - It never opens T3 Code after a plain exit. "Restart T3 now" (Settings, or GET /client/restart)
   closes T3 Code's windows the way the X button does, waits for the exit, swaps and opens it again.
+- Build ahead (client_prebuild.py): about every 30 minutes it looks for a newer release tag of the
+  installed channel and stages the patch for it before it is installed. It keeps the 2 newest
+  staged builds per channel, plus the installed version's. A tag whose build failed is skipped.
+- Right after an update: when T3 Code runs a version it did not run before and the patch for it is
+  staged, the helper restarts T3 Code once, the graceful way, within 15 minutes of T3 Code's start.
+  Never at any other time: a later patch waits for the next restart, with the button in Settings.
 
 python -m dat3uzzo client status     what the autopilot sees and would do
 python -m dat3uzzo client rebuild    build the staged archive for the installed version now
@@ -53,6 +59,10 @@ QUIET_SECONDS = 8.0  # T3 Code must be gone this long before a swap (the updater
 RETRY_SECONDS = 6 * 3600  # a failed build is tried again after this, or at once for a new version or config
 TICK_SECONDS = 5.0
 RESTART_TIMEOUT = 120.0
+TAG_POLL_SECONDS = 1800  # how often the helper looks for a newer release tag to build ahead
+KEEP_STAGED = 2  # staged builds kept per channel (plus the installed version's)
+UPDATE_WINDOW = 900  # the one restart after an update happens only this long after T3 Code started
+SETTLE_SECONDS = 10.0  # and only once T3 Code has run this long and shows a window
 log = logging.getLogger("dat3uzzo.client")
 
 Lister = Callable[[], Iterable[tuple[int, str]]]
@@ -272,6 +282,12 @@ def build_log() -> Path:
     return config.data_dir() / "client-patch-build.log"
 
 
+def prebuild_file() -> Path:
+    """Builds ahead: the newest tag seen, and per version its state (building, staged, unpublished,
+    failed) with the reason."""
+    return config.data_dir() / "client-patch-prebuild.json"
+
+
 def record(version: str) -> dict:
     """What the helper knows about one version: its backup, the original's client folder, and the
     client folders of every archive it swapped in."""
@@ -334,6 +350,32 @@ def list_processes() -> list[tuple[int, str]]:
             size = wintypes.DWORD(len(buf))
             if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
                 out.append((int(pid), buf.value))
+        finally:
+            k32.CloseHandle(handle)
+    return out
+
+
+def process_start_times(pids: set[int]) -> list[float]:
+    """When each process started, in seconds since the epoch. Windows only."""
+    if os.name != "nt" or not pids:
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    out = []
+    for pid in pids:
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            continue
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if k32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+                out.append(ticks / 1e7 - 11644473600)  # FILETIME counts 100 ns steps from 1601
         finally:
             k32.CloseHandle(handle)
     return out
@@ -485,6 +527,8 @@ def apply_now(asar: Path, lister: Lister = list_processes, sleep: Callable[[floa
     kind = classify(version, header)
     if kind == "patched":
         return "active"
+    if desktop.integrity_enforced(asar):  # checked again here: a build ahead was staged before this exe
+        raise Refused("this T3 Code build enforces archive integrity; a changed archive would not load")
     if kind == "unknown":
         raise Refused("the installed server.asar is neither the original nor a staged patch; nothing changed")
     diff = server_differences(header, staged_header)
@@ -564,15 +608,28 @@ def _status(state: str, text: str, restart: bool = False) -> dict:
 
 
 class Autopilot:
-    """One per helper. tick() looks at the install, the switches, the staged archives and the build,
-    then does at most one thing: start a build, swap the patch in, or put the original back."""
+    """One per helper. tick() looks at the install, the switches, the staged archives and the builds,
+    then does at most one thing: start a build, swap the patch in, or put the original back. It also
+    builds ahead for the newest release of the installed channel (client_prebuild.py), and asks for
+    one graceful restart right after T3 Code starts on a new version whose patch is ready."""
 
     def __init__(self, lister: Lister = list_processes, builder: Callable[..., Path] | None = None,
-                 now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep):
+                 now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
+                 tag_lister: Callable[[Path], list[str]] | None = None,
+                 fetcher: Callable[[str, Path], tuple[Path, Path]] | None = None,
+                 started_at: Callable[[set[int]], float | None] | None = None,
+                 window_counter: Callable[[set[int]], int] | None = None):
         self.lister, self.now, self.sleep = lister, now, sleep
         self.builder = builder
+        self.tag_lister = tag_lister
+        self.fetcher = fetcher
+        self.started_at = started_at or (lambda pids: min(process_start_times(pids), default=None))
+        self.window_counter = window_counter or (lambda pids: close_windows(pids, poster=lambda hwnd: True))
         self.last_running = 0.0
         self.build_thread: threading.Thread | None = None
+        self.build_target: tuple[str, str] | None = None  # ("installed" or "ahead", version)
+        self.next_poll = 0.0
+        self.auto_restart_due = False
         self.restarting = False
         self.statuses: dict[str, dict] = {}
         self.lock = threading.Lock()  # one evaluate-and-act at a time (the watch thread and a restart)
@@ -582,19 +639,22 @@ class Autopilot:
     def building(self) -> bool:
         return self.build_thread is not None and self.build_thread.is_alive()
 
+    def _builder(self) -> Callable[..., Path]:
+        if self.builder is not None:
+            return self.builder
+        from . import client_build
+        return client_build.build
+
     def start_build(self, version: str, wanted: list[dict], cfg: dict, original: Path) -> None:
         keys = [patch_key(p) for p in wanted]
         _write_json(build_file(), {"version": version, "patches": keys, "state": "building",
                                    "at": self.now(), "pid": os.getpid()})
+        self.build_target = ("installed", version)
 
         def run():
             try:
-                builder = self.builder
-                if builder is None:
-                    from . import client_build
-                    builder = client_build.build
-                builder(version=version, patches=wanted, keys=keys, repo=Path(cfg["repo"]),
-                        original=original, log_path=build_log())
+                self._builder()(version=version, patches=wanted, keys=keys, repo=Path(cfg["repo"]),
+                                original=original, log_path=build_log())
                 outcome = {"state": "staged", "reason": ""}
                 log.info("built the client patch for %s", version)
             except Exception as e:  # noqa: BLE001 - every failure is recorded and shown, never raised
@@ -602,9 +662,143 @@ class Autopilot:
                 outcome = {"state": "failed", "reason": reason[:300]}
                 log.warning("client patch build for %s failed: %s", version, reason)
             _write_json(build_file(), {"version": version, "patches": keys, "at": self.now(), **outcome})
+            self.build_target = None
 
         self.build_thread = threading.Thread(target=run, name="client-patch-build", daemon=True)
         self.build_thread.start()
+
+    # -------- build ahead
+
+    def _set_ahead(self, version: str, rec: dict) -> None:
+        data = _read_json(prebuild_file())
+        data.setdefault("tags", {})[version] = rec
+        _write_json(prebuild_file(), data)
+
+    def maybe_build_ahead(self, cfg: dict, wanted: list[dict], keys: list[dict], installed: str, now: float) -> None:
+        """About every 30 minutes: find the newest release tag of the installed channel. When it is
+        newer than the installed version and has no staged build, build it ahead. A tag whose build
+        failed is skipped for good (for the same patches), and Settings shows why."""
+        from . import client_prebuild as pb
+        if now < self.next_poll:
+            return
+        self.next_poll = now + TAG_POLL_SECONDS
+        chan = pb.channel(installed)
+        if not chan:
+            return
+        try:
+            tags = (self.tag_lister or pb.list_tags)(Path(cfg["repo"]))
+        except Exception as e:  # noqa: BLE001 - no network now: try at the next check
+            log.warning("release tag check failed: %s", e)
+            return
+        target = pb.newest(tags, chan)
+        data = _read_json(prebuild_file())
+        data.update(checked_at=now, channel=chan, newest=target)
+        _write_json(prebuild_file(), data)
+        for v in pb.prune_staged(installed, KEEP_STAGED):
+            log.info("deleted the staged build for %s (only the %d newest are kept)", v, KEEP_STAGED)
+        if not target or pb.version_key(target) <= pb.version_key(installed):
+            return
+        if read_manifest(target).get("patches") == keys and staged_asar(target).exists():
+            return
+        rec = data.get("tags", {}).get(target, {})
+        if rec.get("state") == "failed" and rec.get("patches") == keys:
+            return
+        self.start_build_ahead(target, wanted, cfg, keys)
+
+    def start_build_ahead(self, version: str, wanted: list[dict], cfg: dict, keys: list[dict]) -> None:
+        from . import client_build, client_prebuild as pb
+        self._set_ahead(version, {"state": "building", "patches": keys, "at": self.now()})
+        self.build_target = ("ahead", version)
+        log.info("building ahead for T3 Code %s", version)
+
+        def run():
+            work = pb.work_dir(version)
+            try:
+                client_build._rmtree(work)
+                original, unpacked = (self.fetcher or pb.fetch_original)(version, work)
+                self._builder()(version=version, patches=wanted, keys=keys, repo=Path(cfg["repo"]),
+                                original=original, log_path=build_log(), unpacked=unpacked)
+                outcome = {"state": "staged", "reason": ""}
+                log.info("built ahead for T3 Code %s", version)
+                asar = install_asar()
+                pb.prune_staged(archive_version(asar) if asar else None, KEEP_STAGED)
+            except pb.NotPublished as e:
+                outcome = {"state": "unpublished", "reason": str(e)}
+            except Exception as e:  # noqa: BLE001 - recorded, shown, and the tag is skipped from now on
+                outcome = {"state": "failed", "reason": (str(e) or type(e).__name__)[:300]}
+                log.warning("build ahead for %s failed: %s", version, outcome["reason"])
+            finally:
+                try:
+                    client_build._rmtree(work)
+                except OSError:
+                    pass
+            self._set_ahead(version, {**outcome, "patches": keys, "at": self.now()})
+            self.build_target = None
+
+        self.build_thread = threading.Thread(target=run, name="client-patch-build-ahead", daemon=True)
+        self.build_thread.start()
+
+    def ahead_note(self, installed: str, keys: list[dict]) -> str:
+        from . import client_prebuild as pb
+        data = _read_json(prebuild_file())
+        target = data.get("newest")
+        if not target or pb.channel(target) != pb.channel(installed) or pb.version_key(target) <= pb.version_key(installed):
+            return ""
+        if read_manifest(target).get("patches") == keys and staged_asar(target).exists():
+            return f"The patch for T3 Code {target} is ready ahead of its install."
+        rec = data.get("tags", {}).get(target, {})
+        state = rec.get("state")
+        if state == "building":
+            return f"Building ahead for T3 Code {target}."
+        if state == "failed" and rec.get("patches") == keys:
+            return f"The build ahead for T3 Code {target} failed, so the helper skips that version: {rec.get('reason')}"
+        if state == "unpublished":
+            return f"T3 Code {target} is tagged, but its installer is not published yet."
+        return ""
+
+    # -------- right after an update
+
+    def after_update(self, version: str, running: bool, kind: str, ready: bool, wanted: bool, now: float,
+                     act: bool, install_dir: Path) -> str:
+        """When T3 Code runs a version that differs from the one the helper last saw running, that is
+        an update. Then, once, within UPDATE_WINDOW of T3 Code's start: ask for one graceful restart
+        as soon as the patch is staged. Never otherwise. Returns a status line, or ""."""
+        if not running:
+            return ""
+        data = _read_json(state_file())
+        last = data.get("last_running_version")
+        if last != version:
+            if not act:
+                return ""
+            data["last_running_version"] = version
+            if last is not None:
+                data["update"] = {"version": version, "from": last, "seen_at": now, "restart": "due"}
+                log.info("T3 Code updated from %s to %s", last, version)
+            _write_json(state_file(), data)
+        upd = data.get("update") or {}
+        if upd.get("version") != version or upd.get("restart") != "due":
+            return ""
+        pids = {pid for pid, _ in t3_processes(install_dir, self.lister)}
+        started = self.started_at(pids) or float(upd.get("seen_at", now))
+        if not wanted or kind == "patched" or now - started > UPDATE_WINDOW:
+            if act:
+                upd["restart"] = "not needed" if (not wanted or kind == "patched") else "expired"
+                data["update"] = upd
+                _write_json(state_file(), data)
+            return ""
+        if not ready:
+            until = time.strftime("%H:%M", time.localtime(started + UPDATE_WINDOW))
+            return (f"T3 Code updated to {version}. When the patch is built, the helper restarts T3 Code once "
+                    f"to put it in (until {until}).")
+        if now - started < SETTLE_SECONDS or self.window_counter(pids) == 0:
+            return f"T3 Code updated to {version}. The helper restarts it once in a moment to put the patch in."
+        if act:
+            upd.update(restart="done", restarted_at=now)
+            data["update"] = upd
+            _write_json(state_file(), data)
+            self.auto_restart_due = True
+            log.info("T3 Code %s: one restart to put the patch in", version)
+        return f"T3 Code updated to {version}. The helper restarts it once now to put the patch in."
 
     # -------- the decision
 
@@ -629,6 +823,7 @@ class Autopilot:
         wanted = wanted_patches(cfg)
         keys = [patch_key(p) for p in wanted]
         on = {p["id"] for p in wanted}
+        ready = bool(wanted) and read_manifest(version).get("patches") == keys and staged_asar(version).exists()
 
         if kind == "unknown":
             overall = _status("failed", f"T3 Code {version} has a server.asar the helper did not make, "
@@ -642,38 +837,51 @@ class Autopilot:
             else:
                 overall = self._do(act, lambda: restore_now(asar, self.lister, self.sleep),
                                    _status("off", "Off. T3 Code runs its original page files."))
+        elif ready and kind == "patched":
+            overall = _status("active", f"Active in T3 Code {version}.")
+        elif ready and not quiet:
+            overall = _status("pending", f"Ready for T3 Code {version}. It applies at the next T3 Code "
+                                         "restart.", restart=True)
+        elif ready:
+            overall = self._do(act, lambda: apply_now(asar, self.lister, self.sleep),
+                               _status("active", f"Active in T3 Code {version}."))
         else:
-            manifest = read_manifest(version)
-            ready = manifest.get("patches") == keys and staged_asar(version).exists()
-            if ready and kind == "patched":
-                overall = _status("active", f"Active in T3 Code {version}.")
-            elif ready and not quiet:
-                overall = _status("pending", f"Ready for T3 Code {version}. It applies at the next T3 Code "
-                                             "restart.", restart=True)
-            elif ready:
-                overall = self._do(act, lambda: apply_now(asar, self.lister, self.sleep),
-                                   _status("active", f"Active in T3 Code {version}."))
-            else:
-                build = _read_json(build_file())
-                same = build.get("version") == version and build.get("patches") == keys
-                if self.building() or (same and build.get("state") == "building" and not act):
-                    overall = _status("building", f"Building for T3 Code {version}. This takes a few minutes; "
-                                                  "T3 Code keeps its original page files meanwhile.")
-                elif same and build.get("state") == "failed" and now - float(build.get("at", 0)) < RETRY_SECONDS:
-                    overall = _status("failed", f"The build for T3 Code {version} failed: {build.get('reason')}. "
-                                                "T3 Code keeps its original page files.")
-                elif act:
-                    rec = record(version)
-                    backup = backups_dir() / rec["backup"] if rec["backup"] else None
-                    original = backup if backup and backup.exists() else asar
-                    if kind != "original" and original is asar:
-                        overall = _status("failed", "No original archive to build from.")
-                    else:
-                        self.start_build(version, wanted, cfg, original)
-                        overall = _status("building", f"Building for T3 Code {version}. This takes a few "
-                                                      "minutes; T3 Code keeps its original page files meanwhile.")
+            build = _read_json(build_file())
+            same = build.get("version") == version and build.get("patches") == keys
+            building_text = (f"Building for T3 Code {version}. This takes a few minutes; T3 Code keeps its "
+                             "original page files meanwhile.")
+            if self.building():
+                target = self.build_target or ("installed", version)
+                overall = _status("building", building_text if target[1] == version else
+                                  f"Waiting for the build ahead for T3 Code {target[1]} to finish, then the "
+                                  f"helper builds for {version}.")
+            elif same and build.get("state") == "building" and not act:
+                overall = _status("building", building_text)
+            elif same and build.get("state") == "failed" and now - float(build.get("at", 0)) < RETRY_SECONDS:
+                overall = _status("failed", f"The build for T3 Code {version} failed: {build.get('reason')}. "
+                                            "T3 Code keeps its original page files.")
+            elif act:
+                rec = record(version)
+                backup = backups_dir() / rec["backup"] if rec["backup"] else None
+                original = backup if backup and backup.exists() else asar
+                if kind != "original" and original is asar:
+                    overall = _status("failed", "No original archive to build from.")
                 else:
-                    overall = _status("building", f"A build for T3 Code {version} starts at the helper's next check.")
+                    self.start_build(version, wanted, cfg, original)
+                    overall = _status("building", building_text)
+            else:
+                overall = _status("building", f"A build for T3 Code {version} starts at the helper's next check.")
+
+        if act and wanted and kind != "unknown" and not self.building() and not self.restarting:
+            self.maybe_build_ahead(cfg, wanted, keys, version, now)
+        ready = bool(wanted) and read_manifest(version).get("patches") == keys and staged_asar(version).exists()
+        update_line = self.after_update(version, running, kind, ready, bool(wanted), now, act, asar.parent.parent)
+        if update_line:
+            overall = {**overall, "text": f"{update_line} {overall['text']}"}
+        if wanted and overall["state"] in ("active", "pending", "building"):
+            note = self.ahead_note(version, keys)
+            if note:
+                overall = {**overall, "text": f"{overall['text']} {note}"}
         out = {}
         for i in ids:
             if i in on or not wanted:
@@ -711,6 +919,7 @@ class Autopilot:
         """Close T3 Code's windows, wait for it to exit (never force), swap, open it again."""
         asar = install_asar()
         if asar is None:
+            self.restarting = False
             return
         install_dir = asar.parent.parent
         self.restarting = True
@@ -774,6 +983,10 @@ async def watch(interval: float = TICK_SECONDS) -> None:
     last = None
     while True:
         result = await asyncio.to_thread(AUTOPILOT.tick) if not AUTOPILOT.restarting else AUTOPILOT.statuses
+        if AUTOPILOT.auto_restart_due and not AUTOPILOT.restarting:  # the one restart after an update
+            AUTOPILOT.auto_restart_due = False
+            AUTOPILOT.restarting = True
+            asyncio.get_running_loop().create_task(AUTOPILOT.restart())
         summary = json.dumps(result, sort_keys=True)
         if summary != last:
             log.info("client patches: %s", "; ".join(f"{k}: {v['text']}" for k, v in result.items()))
@@ -797,9 +1010,10 @@ def compare_unpacked(a: Path, b: Path) -> list[str]:
 
 def stage(client_dir: Path, asar_module: Path, source: str = "", out: Callable[[str], None] = print,
           version: str | None = None, keys: list[dict] | None = None, original: Path | None = None,
-          flags: int | None = None) -> int:
+          flags: int | None = None, unpacked: Path | None = None) -> int:
     """Pack the original archive with a new client folder, check it, add the loader block, and save
-    it with its manifest in staged_dir(version). The installed app is only read."""
+    it with its manifest in staged_dir(version). The installed app is only read. `unpacked` is the
+    original's .unpacked folder; by default the installed one (a swap never changes it)."""
     from . import patcher
     asar = install_asar()
     if asar is None:
@@ -819,7 +1033,7 @@ def stage(client_dir: Path, asar_module: Path, source: str = "", out: Callable[[
     new = work / "server.asar"
     if flags is None:
         flags = 0x4000 if os.name == "nt" else 0  # BELOW_NORMAL_PRIORITY_CLASS
-    unpacked = asar.with_name(asar.name + ".unpacked")  # never changed by a swap, also when original is a backup
+    unpacked = unpacked or asar.with_name(asar.name + ".unpacked")  # never changed by a swap
     done = subprocess.run(["node", str(STAGE_SCRIPT), str(asar_module), str(original), str(client_dir), str(new),
                            str(unpacked)],
                           cwd=str(work / "cwd"), creationflags=flags, stdout=subprocess.PIPE,
@@ -834,7 +1048,7 @@ def stage(client_dir: Path, asar_module: Path, source: str = "", out: Callable[[
     if diff:
         raise Refused(f"{len(diff)} server paths differ from the original, first: {diff[0]}")
     out("check:   every file outside the client folder matches the original (size, SHA-256, unpacked, executable)")
-    unpacked_diff = compare_unpacked(asar.with_name(asar.name + ".unpacked"), new.with_name(new.name + ".unpacked"))
+    unpacked_diff = compare_unpacked(unpacked, new.with_name(new.name + ".unpacked"))
     if unpacked_diff:
         raise Refused(f"unpacked files differ: {unpacked_diff[:3]}")
     marked = sum(1 for n in entries(built).values() if n.get("unpacked"))
@@ -902,6 +1116,19 @@ def print_status(out: Callable[[str], None] = print) -> int:
     build = _read_json(build_file())
     if build:
         out(f"build:    {build.get('version')}: {build.get('state')} {build.get('reason', '')}".rstrip())
+    ahead = _read_json(prebuild_file())
+    if ahead:
+        checked = time.strftime("%Y-%m-%d %H:%M", time.localtime(ahead.get("checked_at", 0)))
+        out(f"tags:     newest {ahead.get('channel')} {ahead.get('newest')} (checked {checked})")
+        for v, rec in sorted(ahead.get("tags", {}).items()):
+            out(f"ahead:    {v}: {rec.get('state')} {rec.get('reason', '')}".rstrip())
+    staged = sorted(d.name for d in (config.data_dir() / "client-patch").glob("*") if d.is_dir() and d.name[0] != ".")
+    out(f"staged builds: {', '.join(staged) or 'none'}")
+    seen = _read_json(state_file())
+    if seen.get("last_running_version"):
+        upd = seen.get("update") or {}
+        out(f"seen:     T3 Code {seen['last_running_version']} last seen running"
+            + (f"; update from {upd.get('from')}: restart {upd.get('restart')}" if upd else ""))
     running = t3_processes(asar.parent.parent)
     out(f"T3 Code:  {'running (' + str(len(running)) + ' processes)' if running else 'not running'}")
     out(f"config:   {config_file()}")
