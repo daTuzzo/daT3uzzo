@@ -175,6 +175,10 @@ Then put this in `%LOCALAPPDATA%\dat3uzzo\client-patches.json`:
 
 The patch gets a row in Settings > General > daT3uzzo with its status. A build takes about 5 minutes, at idle priority. The swap waits until T3 Code is closed, or the row's **Restart T3 now** button closes T3 Code gracefully and opens it again. The helper backs up the original `server.asar` first and never overwrites a backup. [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#client-patches) has the details.
 
+So that the patched page stays after an update:
+- **Build ahead.** About every 30 minutes, the helper runs `git ls-remote --tags --refs origin` in the clone and finds the newest release tag of your channel (Nightly `v<x.y.z>-nightly.<date>.<run>`, Stable `v<x.y.z>`). If it is newer than your installed version, the helper builds the patch for it before you install it. The release's own `server.asar` comes from its installer: the updater's download when it is there, else the GitHub release asset. Both are checked against the release's SHA-512. The helper keeps the 2 newest staged builds per channel, plus the installed version's. A version whose build failed is skipped, and its row shows why.
+- **Right after an update.** When T3 Code starts on a version that the helper has not seen running before, and the patch for that version is staged, the helper restarts T3 Code once, the graceful way: you see one quick blink. If the patch is not staged yet, the helper builds it and restarts T3 Code once it is ready, but only within 15 minutes of the start. After that, it waits for your next restart and shows the **Restart T3 now** button. The helper never restarts T3 Code at any other time.
+
 ## Uninstall
 
 ```
@@ -209,4 +213,4 @@ T3 Code is made by [pingdotgg](https://github.com/pingdotgg/t3code). daT3uzzo is
 
 ## Licence
 
-[MIT](LICENSE), copyright 2026 daTuzzo. The Python libraries are used unmodified: `websockets` (BSD-3-Clause), `num2words` (LGPL-2.1), `lameenc` (LGPL-3.0-or-later), `keyring` (MIT) and `miniaudio` (MIT). Icons: Lucide (ISC).
+[MIT](LICENSE), copyright 2026 daTuzzo. The Python libraries are used unmodified: `websockets` (BSD-3-Clause), `num2words` (LGPL-2.1), `lameenc` (LGPL-3.0-or-later), `keyring` (MIT), `miniaudio` (MIT) and `py7zr` (LGPL-2.1-or-later). Icons: Lucide (ISC).

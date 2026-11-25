@@ -266,8 +266,9 @@ def work_dir(version: str) -> Path:
 
 
 def build(version: str, patches: list[dict], keys: list[dict], repo: Path, original: Path, log_path: Path,
-          out: Callable[[str], None] | None = None) -> Path:
-    """Build and stage the patch for one version. Raises BuildFailed with the reason."""
+          out: Callable[[str], None] | None = None, unpacked: Path | None = None) -> Path:
+    """Build and stage the patch for one version. Raises BuildFailed with the reason. `unpacked` is
+    the original's .unpacked folder when the original is not the installed archive (a build ahead)."""
     r = Runner(log_path, out or (lambda s: None))
     git = _tool("git")
     work = work_dir(version)
@@ -307,7 +308,7 @@ def build(version: str, patches: list[dict], keys: list[dict], repo: Path, origi
             (client / "third-party-licenses.json").write_bytes(client_patch.read_file(original, licences))
         source = f"{tag} + " + ", ".join(f"{pid} {' '.join(s[:10] for s in shas)}" for pid, shas in commits)
         client_patch.stage(client, asar_module(wt), source=source, out=r.note, version=version, keys=keys,
-                           original=original, flags=_flags())
+                           original=original, flags=_flags(), unpacked=unpacked)
         r.note(f"=== staged for {version} in {time.monotonic() - started:.0f} s")
         return client_patch.staged_asar(version)
     except client_patch.Refused as e:
