@@ -15,6 +15,7 @@ Both screenshots come from the stand-in test page in `eval/`, with made-up text.
 | Add-on | Kind | What it does |
 |---|---|---|
 | **Read aloud** (`t3-read-aloud`) | browser + helper | A speaker button on each finished reply. It reads the reply aloud, with a player (play, pause, seek, speed), word highlighting, follow-along scrolling and saved audio. |
+| **Sidebar peek** (`sidebar-peek`) | browser | While the main sidebar is closed, pointing at its button slides it in over the page. It slides away when the pointer leaves it, or after you open a thread from it. |
 | **Usage periods** (`usage-periods`) | client patch, optional | The Usage page with 180 days, 1 year and a custom range. Advanced: see [Client patches](#client-patches-advanced-optional). |
 
 ### Read aloud
@@ -37,6 +38,15 @@ Voice services:
 Word highlighting with OpenAI or OpenRouter adds speech-to-text at about $0.006 per audio minute (OpenAI's list price for `whisper-1`). Turn highlighting off in Settings to skip it. A reply played again from saved audio costs $0.
 
 The measured numbers for OpenAI Realtime with `gpt-realtime-2.1`: the first sound comes after about 1 to 2.6 seconds, and the helper makes about 3.8 seconds of audio per second, so you can seek ahead soon after the start. One hour of listening costs about $5.33.
+
+### Sidebar peek
+
+- Close the main sidebar, then point at its button in the top left corner. The sidebar slides in over the page, and the page under it does not move.
+- It slides away when the pointer leaves the sidebar and the button, after you open a thread or another page from it, or on Esc.
+- It stays while you type in one of its fields (the search, a thread's new name) and while a menu opened from it is open.
+- A click on the button, or its shortcut, still opens the sidebar for good. A peek never changes the sidebar state that T3 Code saves.
+- It works with a mouse, in the wide layout (768 px and wider), where T3 Code keeps the closed sidebar on the page.
+- The slide takes 150 ms, or T3 Code's panel animation time when that setting is on. With reduced motion there is no slide.
 
 ## Install on Windows (2 minutes)
 
