@@ -50,6 +50,24 @@ ${SIDEBAR}[data-state="collapsed"][${ATTR}="open"] > ${CONTAINER} {
 }`;
   document.head.appendChild(style);
 
+  // Desktop app: T3 Code's top bar is a window drag region, and Electron gives a drag region every
+  // click over it, even on elements drawn above it. It applies regions in page order, and the sidebar
+  // comes before the top bar, so the peeked sidebar's own rules cannot win there. This empty no-drag
+  // box goes last in <body> for the length of a peek and covers the sidebar. It takes no pointer
+  // events, so clicks still reach the sidebar under it.
+  const shim = document.createElement("div");
+  shim.setAttribute("data-t3sp-no-drag", "");
+  shim.style.cssText =
+    "position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;-webkit-app-region:no-drag;app-region:no-drag";
+  const coverSidebar = (sidebar) => {
+    const container = sidebar.querySelector(`:scope > ${CONTAINER}`);
+    const width = container ? container.getBoundingClientRect().width : 0;
+    if (!(width > 0)) return;
+    shim.style.width = `${Math.round(width)}px`;
+    shim.style.height = "100vh";
+    document.body.appendChild(shim);
+  };
+
   let peek = null; // { sidebar, path, observer } while the sidebar is peeking
   let openTimer = 0;
   let closeTimer = 0;
@@ -74,6 +92,7 @@ ${SIDEBAR}[data-state="collapsed"][${ATTR}="open"] > ${CONTAINER} {
     clearTimeout(closeTimer);
     closeTimer = 0;
     observer.disconnect();
+    shim.remove();
     document.removeEventListener("keydown", onKeyDown, true);
     document.removeEventListener("click", onClick, true);
     window.navigation?.removeEventListener?.("currententrychange", onNavigate);
@@ -100,6 +119,7 @@ ${SIDEBAR}[data-state="collapsed"][${ATTR}="open"] > ${CONTAINER} {
     clearTimeout(settleTimer);
     sidebar.inert = false;
     sidebar.setAttribute(ATTR, "open");
+    coverSidebar(sidebar);
     document.addEventListener("keydown", onKeyDown, true);
     document.addEventListener("click", onClick, true);
     window.navigation?.addEventListener?.("currententrychange", onNavigate);
