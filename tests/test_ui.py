@@ -50,6 +50,24 @@ class Base(unittest.TestCase):
         (self.web / "example.js").write_text(EXAMPLE, encoding="utf-8")
 
 
+class Shipped(unittest.TestCase):
+    """The add-ons in this repo's own web/ folder, as Settings lists them."""
+
+    def test_each_shipped_browser_add_on_has_a_label_and_a_description(self):
+        with mock.patch.object(ui, "client_mods", return_value={}):
+            mods = {m.id: m for m in ui.find_mods(config.PROJECT_ROOT / "web")}
+        browser = [m for m in mods.values() if "browser" in m.kinds]
+        self.assertIn("t3-read-aloud", [m.id for m in browser])
+        for m in browser:
+            self.assertNotEqual(m.label, m.id, f"{m.id}.js needs a // @mod-label line")
+            self.assertTrue(m.desc, f"{m.id}.js needs a // @mod-desc line")
+
+    def test_sidebar_peek_is_a_browser_only_add_on(self):
+        with mock.patch.object(ui, "client_mods", return_value={}):
+            peek = next(m for m in ui.find_mods(config.PROJECT_ROOT / "web") if m.id == "sidebar-peek")
+        self.assertEqual((peek.label, peek.kinds), ("Sidebar peek", ("browser",)))
+
+
 class State(Base):
     def test_missing_file_means_all_on(self):
         self.assertFalse(self.state.exists())
